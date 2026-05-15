@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 from typing import List
 from models import Product
 import asyncio, json
+from datetime import datetime, timezone
 
 producer = AIOKafkaProducer(bootstrap_servers='kafka:9092')
 
@@ -37,13 +38,46 @@ async def consume(consumer: AIOKafkaConsumer):
         async for msg in consumer:
             order = json.loads(msg.value.decode('utf-8'))
             product = products_db.get(order['product_id'])
-            
-            if product and product.quantity >= order['quantity']:
-                product.quantity -= order['quantity']
-                await producer.send_and_wait("order-confirmed", json.dumps({
+
+            timestamp = datetime.now(timezone.utc).isoformat()
+
+            if product is None:
+                # Scenario 1: Product does not exist
+                error_event = {
                     "order_id": order['id'],
-                    "product_id": product.id
-                }).encode('utf-8'))
+                    "product_id": order['product_id'],
+                    "timestamp": timestamp,
+                    "error_reason": "Proizvod ne postoji u katalogu"
+                }
+                await producer.send_and_wait(
+                    "product_not_found_events",
+                    json.dumps(error_event).encode('utf-8')
+                )
+
+            elif product.quantity < order['quantity']:
+                # Scenario 2: Insufficient stock
+                error_event = {
+                    "order_id": order['id'],
+                    "product_id": order['product_id'],
+                    "timestamp": timestamp,
+                    "error_reason": "Nedovoljna količina na stanju"
+                }
+                await producer.send_and_wait(
+                    "out_of_stock_events",
+                    json.dumps(error_event).encode('utf-8')
+                )
+
+            else:
+                # Happy path: reserve stock and confirm order
+                product.quantity -= order['quantity']
+                await producer.send_and_wait(
+                    "order-confirmed",
+                    json.dumps({
+                        "order_id": order['id'],
+                        "product_id": product.id
+                    }).encode('utf-8')
+                )
+
     except asyncio.CancelledError:
         pass
 
